@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: logs-insights-to-metric
+
+
+Parameters:
+
+  LogGroupNames:
+    Type: String
+    Description: Comma separated names of CloudWatch log groups to query
+    AllowedPattern: '.+'
+    ConstraintDescription: LogGroupName is mandatory parameter
+  QueryString:
+    Type: String
+    Description: CloudWatch Insights query string to run
+    Default: 'fields @log, @timestamp, @message | stats count() by @log'
+  QueryGroupBy:
+    Type: String
+    Description: CloudWatch Insights field name used for grouping
+    Default: '@log'
+  QueryPeriod:
+    Type: Number
+    Description: Time window size in minutes
+    Default: 5
+  QueryDelay:
+    Type: Number
+    Description: Time to wait before data available to query in minutes
+    Default: 3
+  QueryRetry:
+    Type: Number
+    Description: Delay between getQueryResults retries in ms
+    Default: 1000
+  MetricName:
+    Type: String
+    Description: A name of CloudWatch metric to put data into
+    AllowedPattern: '.+'
+    ConstraintDescription: MetricName is mandatory parameter
+  MetricNamespace:
+    Type: String
+    Description: A namespace of CloudWatch metric to put data into
+    AllowedPattern: '.+'
+    ConstraintDescription: MetricNamespace is mandatory parameter
+  Dimensions:
+    Type: String
+    Description: Optional metric dimensions definition in JSON
+    Default: ''
+  GroupingDimensionName:
+    Type: String
+    Description: A name of metric dimension used for grouping
+    Default: 'Log group'
+  Unit:
+    Type: String
+    Description: Optional unit name
+    Default: 'Count'
+  SkipEmpty:
+    Type: String
+    Description: Wether to skip empty query results or post them as zeros
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Default: 'true'
+  AWSSDKLayerArn:
+    Type: String
+    Description: AWS SDK layer supporting Log Insights methods
+
+
+Conditions:
+
+  QueryPeriod1Min: !Equals [ !Ref QueryPeriod, 1 ]
+
+
+Resources:
+
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+      Policies:
+        - PolicyName: CW
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - cloudwatch:PutMetricData
+              - logs:GetQueryResults
+              - logs:StartQuery
+              Effect: Allow
+              Resource: '*'
+  
+  LambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        
+        const cloudwatchlogs = new AWS.CloudWatchLogs();
+        const cloudwatch = new AWS.CloudWatch();
+        
+        const logGroupNames = process.env.LOG_GROUPS.split(',');
+        const queryString = process.env.QUERY_STRING;
+        const queryGroupBy = process.env.QUERY_GROUPBY;
+        const queryPeriod = process.env.QUERY_PERIOD;
+        const queryDelay = process.env.QUERY_DELAY;
+        const queryRetry = process.env.QUERY_RETRY;
+        const MetricName = process.env.METRIC_NAME;
+        const MetricNamespace = process.env.METRIC_NAMESPACE;
+        const Dimensions = process.env.METRIC_DIMENSIONS ? JSON.parse(process.env.METRIC_DIMENSIONS) : [];
+        const GroupingDimensionName = process.env.GROUPING_DIMENSION;
+        const Unit = process.env.METRIC_UNIT;
+        const skipEmpty = process.env.SKIP_EMPTY ? process.env.SKIP_EMPTY === 'true' : true;
+        
+        function sleep(ms) {
+          return x => new Promise(resolve => setTimeout(() => resolve(x), ms));
+        }
+        
+        exports.handler = async (event, context) => {
+          // console.log(`REQUEST RECEIVED:\n${JSON.stringify(event)}`);
+          const endTime = Math.floor(new Date(event.time).getTime() / 1000) - queryDelay * 60;
+          const metricData = {
+            MetricName,
+            Timestamp: endTime,
+            Unit,
+          };
+          const paramsStartQuery = {
+            endTime,
+            logGroupNames,
+            queryString,
+            startTime: endTime - queryPeriod * 60,
+            limit: 1,
+          };
+          return cloudwatchlogs.startQuery(paramsStartQuery).promise().then(async (data) => {
+            let queryResults;
+            let status = '';
+            while (!['Complete', 'Failed', 'Cancelled'].includes(status)) {
+              queryResults = await cloudwatchlogs.getQueryResults({ queryId: data.queryId }).promise().then(sleep(queryRetry)).catch((err) => { console.log(err); return { status: 'Failed' }; });
+              ({ status } = queryResults);
+              console.log(status);
+            }
+            if (status === 'Complete') {
+              // console.log(JSON.stringify(queryResults));
+              if (queryResults.results.length > 0 || !skipEmpty) {
+                const metrics = queryGroupBy === '' ? [{
+                  Dimensions: Dimensions.length > 0 ? Dimensions : undefined,
+                  Value: queryResults.results.length > 0 ? queryResults.results[0][0].value : 0,
+                  ...metricData,
+                }] : (queryResults.results.length > 0 ? queryResults.results.map((entry) => {
+                  const dataPoint = {};
+                  for (const e of entry) {
+                    if (e.field === queryGroupBy) { dataPoint.Name = queryGroupBy === '@log' ? e.value.split(':').pop() : e.value; }
+                    if (e.field !== queryGroupBy) { dataPoint.Value = e.value; }
+                  }
+                  return {
+                    Dimensions: [{ Name: GroupingDimensionName, Value: dataPoint.Name }, ...Dimensions],
+                    Value: dataPoint.Value,
+                    ...metricData,
+                  };
+                }) : logGroupNames.map(entry => ({
+                  Dimensions: [{ Name: GroupingDimensionName, Value: entry }, ...Dimensions],
+                  Value: 0,
+                  ...metricData,
+                })));
+                const paramsPutMetricData = {
+                  MetricData: metrics,
+                  Namespace: MetricNamespace,
+                };
+                return cloudwatch.putMetricData(paramsPutMetricData).promise().catch((err) => { console.log(err); });
+              }
+              console.log('No data found - skipped');
+              return `Query ${data.queryId} returned no data`;
+            }
+            console.log('Query failed');
+            return `Query ${data.queryId} failed:\n${queryString}`;
+          }).catch((err) => { console.log(err); });
+        };
+      Environment:
+        Variables:
+          LOG_GROUPS: !Ref LogGroupNames
+          QUERY_STRING: !Ref QueryString
+          QUERY_GROUPBY: !Ref QueryGroupBy
+          QUERY_PERIOD: !Ref QueryPeriod
+          QUERY_DELAY: !Ref QueryDelay
+          QUERY_RETRY: !Ref QueryRetry
+          METRIC_NAME: !Ref MetricName
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          METRIC_DIMENSIONS: !Ref Dimensions
+          GROUPING_DIMENSION: !Ref GroupingDimensionName
+          METRIC_UNIT: !Ref Unit
+          SKIP_EMPTY: !Ref SkipEmpty
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaFunctionRole
+        - Arn
+      Runtime: nodejs8.10
+      Layers:
+        - !Ref AWSSDKLayerArn
+      Timeout: 60
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled rule for logs subscription
+      ScheduleExpression:
+        Fn::Join:
+        - ''
+        - - 'rate('
+          - !Ref QueryPeriod
+          - !If [ QueryPeriod1Min, ' minute)', ' minutes)']
+      State: ENABLED
+      Targets:
+      - Arn:
+          Fn::GetAtt:
+          - LambdaFunction
+          - Arn
+        Id: LambdaFunction
+  
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt 
+        - LambdaFunction
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt
+        - ScheduledRule
+        - Arn
