@@ -60,9 +60,6 @@ Parameters:
     - 'true'
     - 'false'
     Default: 'true'
-  AWSSDKLayerArn:
-    Type: String
-    Description: AWS SDK layer supporting Log Insights methods
 
 
 Conditions:
@@ -201,9 +198,7 @@ Resources:
       Role: !GetAtt
         - LambdaFunctionRole
         - Arn
-      Runtime: nodejs8.10
-      Layers:
-        - !Ref AWSSDKLayerArn
+      Runtime: nodejs12.x
       Timeout: 60
 
   ScheduledRule:
