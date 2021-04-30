@@ -13,7 +13,6 @@ Deployment parameters
 ---------------------
 
 Must set:
-- _AWSSDKLayerArn_ - AWS SDK layer supporting CloudWatch Logs Insights methods
 - _LogGroupNames_ - Comma separated names of CloudWatch log groups to query
 - _MetricName_ - A name of CloudWatch metric to put data into
 - _MetricNamespace_ - A namespace of CloudWatch metric to put data into
