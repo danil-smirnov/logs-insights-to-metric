@@ -198,7 +198,7 @@ Resources:
       Role: !GetAtt
         - LambdaFunctionRole
         - Arn
-      Runtime: nodejs12.x
+      Runtime: nodejs16.x
       Timeout: 60
 
   ScheduledRule:
